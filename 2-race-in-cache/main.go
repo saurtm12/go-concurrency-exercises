@@ -10,6 +10,7 @@ package main
 
 import (
 	"container/list"
+	"sync"
 	"testing"
 )
 
@@ -29,6 +30,7 @@ type page struct {
 
 // KeyStoreCache is a LRU cache for string key-value pairs
 type KeyStoreCache struct {
+	mu    sync.RWMutex
 	cache map[string]*list.Element
 	pages list.List
 	load  func(string) string
@@ -44,23 +46,46 @@ func New(load KeyStoreCacheLoader) *KeyStoreCache {
 
 // Get gets the key from cache, loads it from the source if needed
 func (k *KeyStoreCache) Get(key string) string {
-	if e, ok := k.cache[key]; ok {
-		k.pages.MoveToFront(e)
-		return e.Value.(page).Value
+	// Try to retrieve from cache using a read lock
+	k.mu.RLock()
+	val, ok := k.cache[key]
+	if ok {
+		k.pages.MoveToFront(val)
+		value := val.Value.(*page).Value
+		k.mu.RUnlock()
+		return value
 	}
-	// Miss - load from database and save it in cache
-	p := page{key, k.load(key)}
-	// if cache is full remove the least used item
+	k.mu.RUnlock()
+
+	// Cache miss - load from the database
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	// Re-check the cache after acquiring the write lock in case another
+	// goroutine already added the key
+	val, ok = k.cache[key]
+	if ok {
+		k.pages.MoveToFront(val)
+		return val.Value.(*page).Value
+	}
+
+	valueString := k.load(key)
+
+	// Evict least-used item if cache is full
 	if len(k.cache) >= CacheSize {
-		end := k.pages.Back()
-		// remove from map
-		delete(k.cache, end.Value.(page).Key)
-		// remove from list
-		k.pages.Remove(end)
+		back := k.pages.Back()
+		if back != nil {
+			delete(k.cache, back.Value.(*page).Key)
+			k.pages.Remove(back)
+		}
 	}
-	k.pages.PushFront(p)
+
+	// Add new item to cache
+	pageEntry := &page{Key: key, Value: valueString}
+	k.pages.PushFront(pageEntry)
 	k.cache[key] = k.pages.Front()
-	return p.Value
+
+	return valueString
 }
 
 // Loader implements KeyStoreLoader
